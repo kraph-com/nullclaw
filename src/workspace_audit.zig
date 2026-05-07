@@ -581,9 +581,18 @@ fn detectLine(path: []const u8, line: []const u8, source: FindingSource) ?Detect
         return classifySecretAssignment(path, line, path_category, assignment);
     }
 
-    if ((source == .git_staged_diff or source == .git_history) and hasTokenPrefix(line) and !looksPlaceholder(line)) {
-        return .{ .severity = .high, .confidence = .high, .rule = "hardcoded_token" };
+    if (hasTokenPrefix(line) and !looksPlaceholder(line)) {
+        return .{
+            .severity = .high,
+            .confidence = if (source == .git_staged_diff or source == .git_history or path_category == .config)
+                .high
+            else
+                .medium,
+            .rule = "hardcoded_token",
+        };
     }
+
+    if (detectHighEntropyCandidate(path, line, source)) |rule| return rule;
 
     return null;
 }
@@ -592,61 +601,37 @@ const AssignmentMatch = struct {
     key: []const u8,
     value: []const u8,
     quoted: bool,
+    keyword_score: u8,
+    strong_keyword: bool,
 };
 
 fn matchSecretAssignment(line: []const u8) ?AssignmentMatch {
-    const keywords = [_][]const u8{
-        "api_key",
-        "api-key",
-        "apikey",
-        "token",
-        "password",
-        "passwd",
-        "secret",
-        "api_secret",
-        "access_key",
+    const sep_idx = findAssignmentSeparator(line) orelse return null;
+    const lhs = std.mem.trim(u8, line[0..sep_idx], " \t\"'`");
+    const key = extractAssignmentKey(lhs) orelse return null;
+    const key_traits = analyzeSecretKeyName(key);
+    if (key_traits.score == 0) return null;
+
+    var pos = sep_idx + 1;
+    while (pos < line.len and (line[pos] == ' ' or line[pos] == '"' or line[pos] == '\'')) pos += 1;
+    if (pos >= line.len) return null;
+    const quoted = pos > sep_idx + 1 and (line[pos - 1] == '"' or line[pos - 1] == '\'');
+
+    const value_start = pos;
+    var value_end = value_start;
+    while (value_end < line.len) : (value_end += 1) {
+        const ch = line[value_end];
+        if (ch == '"' or ch == '\'' or ch == ',' or ch == '#' or ch == ' ' or ch == '\t' or ch == ';') break;
+    }
+    if (value_end <= value_start) return null;
+
+    return .{
+        .key = key,
+        .value = line[value_start..value_end],
+        .quoted = quoted,
+        .keyword_score = key_traits.score,
+        .strong_keyword = key_traits.strong,
     };
-
-    for (keywords) |keyword| {
-        if (indexOfIgnoreCase(line, keyword)) |idx| {
-            if (!keywordBoundaryOk(line, idx, keyword.len)) continue;
-
-            var pos = idx + keyword.len;
-            while (pos < line.len and (line[pos] == ' ' or line[pos] == '"' or line[pos] == '\'')) pos += 1;
-            if (pos >= line.len or (line[pos] != '=' and line[pos] != ':')) continue;
-            pos += 1;
-            while (pos < line.len and (line[pos] == ' ' or line[pos] == '"' or line[pos] == '\'')) pos += 1;
-            if (pos >= line.len) continue;
-            const quoted = pos > 0 and (line[pos - 1] == '"' or line[pos - 1] == '\'');
-
-            const value_start = pos;
-            var value_end = value_start;
-            while (value_end < line.len) : (value_end += 1) {
-                const ch = line[value_end];
-                if (ch == '"' or ch == '\'' or ch == ',' or ch == '#' or ch == ' ' or ch == '\t') break;
-            }
-            if (value_end <= value_start) continue;
-
-            return .{
-                .key = line[idx .. idx + keyword.len],
-                .value = line[value_start..value_end],
-                .quoted = quoted,
-            };
-        }
-    }
-    return null;
-}
-
-fn keywordBoundaryOk(line: []const u8, idx: usize, len: usize) bool {
-    if (idx > 0) {
-        const before = line[idx - 1];
-        if (std.ascii.isAlphanumeric(before) or before == '_' or before == '-') return false;
-    }
-    if (idx + len < line.len) {
-        const after = line[idx + len];
-        if (std.ascii.isAlphanumeric(after) or after == '_' or after == '-') return false;
-    }
-    return true;
 }
 
 fn normalizeValue(value: []const u8) []const u8 {
@@ -820,42 +805,42 @@ fn classifySecretAssignment(
     const known_token = hasTokenPrefix(value);
     const opaque_value = looksOpaqueSecretValue(value);
     const expression = looksLikeExpression(value) and !known_token and !opaque_value;
-    const high_risk_keyword = isHighRiskKeyword(assignment.key);
+    const high_risk_keyword = assignment.strong_keyword or assignment.keyword_score >= 4 or isHighRiskKeyword(assignment.key);
 
     if (expression or looksLikeAccessorLine(line)) return null;
 
     switch (path_category) {
         .vendor_like => {
-            if (!known_token) return null;
+            if (!known_token and assignment.keyword_score < 4) return null;
         },
         .docs => {
-            if (!known_token and !(assignment.quoted and opaque_value)) return null;
+            if (!known_token and !opaque_value and assignment.keyword_score < 2 and value.len < 12) return null;
         },
         .code => {
-            if (!known_token and !(assignment.quoted and (opaque_value or high_risk_keyword))) return null;
+            if (!known_token and !opaque_value and !assignment.quoted and assignment.keyword_score < 2 and value.len < 12) return null;
         },
         .config => {
-            if (!known_token and !opaque_value and !(high_risk_keyword and (assignment.quoted or value.len >= 8))) {
+            if (!known_token and !opaque_value and !high_risk_keyword and assignment.keyword_score < 2 and value.len < 8) {
                 return null;
             }
         },
         .neutral => {
-            if (!known_token and !opaque_value and !(high_risk_keyword and (assignment.quoted or value.len >= 8))) {
+            if (!known_token and !opaque_value and !high_risk_keyword and assignment.keyword_score < 2 and value.len < 12) {
                 return null;
             }
         },
     }
 
-    const severity: Severity = if (known_token or high_risk_keyword or (path_category == .config and opaque_value))
+    const severity: Severity = if (known_token or high_risk_keyword or assignment.keyword_score >= 3 or (path_category == .config and opaque_value))
         .high
     else
         .medium;
     const confidence: Confidence = if (known_token)
         .high
     else switch (path_category) {
-        .config => if (opaque_value or high_risk_keyword) .medium else .low,
-        .neutral => if (opaque_value or high_risk_keyword) .medium else .low,
-        .code => .medium,
+        .config => if (opaque_value or high_risk_keyword or assignment.keyword_score >= 3) .medium else .low,
+        .neutral => if (opaque_value or high_risk_keyword or assignment.keyword_score >= 3) .medium else .low,
+        .code => if (high_risk_keyword or assignment.keyword_score >= 3) .medium else .low,
         .docs => .low,
         .vendor_like => .medium,
     };
@@ -865,6 +850,110 @@ fn classifySecretAssignment(
         .confidence = confidence,
         .rule = if (std.mem.indexOf(u8, path, ".env") != null) "env_secret_assignment" else "secret_assignment",
     };
+}
+
+const SecretKeyTraits = struct {
+    score: u8,
+    strong: bool,
+};
+
+fn findAssignmentSeparator(line: []const u8) ?usize {
+    for (line, 0..) |ch, idx| {
+        switch (ch) {
+            '=' => return idx,
+            ':' => {
+                if (idx + 2 < line.len and line[idx + 1] == '/' and line[idx + 2] == '/') continue;
+                return idx;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn extractAssignmentKey(lhs: []const u8) ?[]const u8 {
+    var trimmed = std.mem.trim(u8, lhs, " \t\"'`");
+    if (trimmed.len == 0) return null;
+
+    if (startsWithIgnoreCase(trimmed, "export ")) {
+        trimmed = std_compat.mem.trimLeft(u8, trimmed[7..], " \t");
+    }
+
+    var end = trimmed.len;
+    while (end > 0 and !isIdentifierChar(trimmed[end - 1])) : (end -= 1) {}
+    if (end == 0) return null;
+
+    var start = end;
+    while (start > 0 and isIdentifierChar(trimmed[start - 1])) : (start -= 1) {}
+    if (start == end) return null;
+    return trimmed[start..end];
+}
+
+fn analyzeSecretKeyName(key: []const u8) SecretKeyTraits {
+    var score: u8 = 0;
+    var strong = false;
+
+    var start: usize = 0;
+    while (start < key.len) {
+        while (start < key.len and !std.ascii.isAlphanumeric(key[start])) : (start += 1) {}
+        if (start >= key.len) break;
+
+        var end = start;
+        while (end < key.len and std.ascii.isAlphanumeric(key[end])) : (end += 1) {}
+        const component = key[start..end];
+
+        const component_score = scoreSecretKeyComponent(component);
+        score +|= component_score.score;
+        strong = strong or component_score.strong;
+        start = end + 1;
+    }
+
+    return .{ .score = score, .strong = strong };
+}
+
+const ComponentScore = struct {
+    score: u8,
+    strong: bool,
+};
+
+fn scoreSecretKeyComponent(component: []const u8) ComponentScore {
+    if (component.len == 0) return .{ .score = 0, .strong = false };
+
+    if (eqlIgnoreCase(component, "token") or
+        eqlIgnoreCase(component, "secret") or
+        eqlIgnoreCase(component, "password") or
+        eqlIgnoreCase(component, "passwd") or
+        eqlIgnoreCase(component, "apikey") or
+        eqlIgnoreCase(component, "clientsecret") or
+        eqlIgnoreCase(component, "privatekey") or
+        eqlIgnoreCase(component, "bearertoken") or
+        eqlIgnoreCase(component, "secretaccesskey"))
+    {
+        return .{ .score = 3, .strong = true };
+    }
+
+    if (eqlIgnoreCase(component, "access") or
+        eqlIgnoreCase(component, "key") or
+        eqlIgnoreCase(component, "auth") or
+        eqlIgnoreCase(component, "bearer") or
+        eqlIgnoreCase(component, "credential") or
+        eqlIgnoreCase(component, "credentials") or
+        eqlIgnoreCase(component, "session") or
+        eqlIgnoreCase(component, "client") or
+        eqlIgnoreCase(component, "private") or
+        eqlIgnoreCase(component, "api") or
+        eqlIgnoreCase(component, "webhook") or
+        eqlIgnoreCase(component, "slack") or
+        eqlIgnoreCase(component, "aws"))
+    {
+        return .{ .score = 1, .strong = false };
+    }
+
+    return .{ .score = 0, .strong = false };
+}
+
+fn isIdentifierChar(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-';
 }
 
 fn isDocumentationPath(path: []const u8) bool {
@@ -928,6 +1017,9 @@ fn looksLikeExpression(value: []const u8) bool {
     if (std.mem.indexOfScalar(u8, value, '(') != null or std.mem.indexOfScalar(u8, value, ')') != null) return true;
     if (std.mem.indexOf(u8, value, "std.") != null) return true;
     if (std.mem.indexOf(u8, value, ".get") != null) return true;
+    if (std.mem.indexOf(u8, value, "process.env.") != null) return true;
+    if (std.mem.indexOf(u8, value, "System.getenv") != null) return true;
+    if (std.mem.indexOf(u8, value, "getenv") != null) return true;
     if (std.mem.indexOf(u8, value, "trim") != null and std.mem.indexOfScalar(u8, value, '(') != null) return true;
     if (std.mem.indexOfScalar(u8, value, '{') != null or std.mem.indexOfScalar(u8, value, '}') != null) return true;
     return false;
@@ -937,6 +1029,111 @@ fn looksLikeAccessorLine(line: []const u8) bool {
     return std.mem.indexOf(u8, line, ".get(\"authorization\")") != null or
         std.mem.indexOf(u8, line, ".get(\"token\")") != null or
         std.mem.indexOf(u8, line, ".headers.get(") != null;
+}
+
+fn detectHighEntropyCandidate(path: []const u8, line: []const u8, source: FindingSource) ?DetectedRule {
+    _ = source;
+    const path_category = classifyPath(path);
+    if (!containsHighEntropyCandidate(line)) return null;
+
+    return .{
+        .severity = if (path_category == .config) .high else .medium,
+        .confidence = switch (path_category) {
+            .config => .medium,
+            .neutral => .medium,
+            .code => .low,
+            .docs => .low,
+            .vendor_like => .low,
+        },
+        .rule = "high_entropy_secret_candidate",
+    };
+}
+
+fn containsHighEntropyCandidate(line: []const u8) bool {
+    var i: usize = 0;
+    while (i < line.len) {
+        while (i < line.len and !isEntropyCharset(line[i])) : (i += 1) {}
+        if (i >= line.len) break;
+
+        const start = i;
+        while (i < line.len and isEntropyCharset(line[i])) : (i += 1) {}
+        const candidate_run = line[start..i];
+
+        if (candidateFromEntropyRun(candidate_run)) |candidate| {
+            if (candidate.len >= 16 and
+                !looksPlaceholder(candidate) and
+                !looksLikeUuid(candidate) and
+                !looksLikeGitCommitHash(candidate) and
+                computeShannonEntropy(candidate) >= 4.0)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+fn candidateFromEntropyRun(candidate_run: []const u8) ?[]const u8 {
+    if (candidate_run.len < 16) return null;
+    if (std.mem.lastIndexOfScalar(u8, candidate_run, '=')) |eq_idx| {
+        const rhs = candidate_run[eq_idx + 1 ..];
+        if (rhs.len >= 16) return rhs;
+    }
+    return candidate_run;
+}
+
+fn isEntropyCharset(ch: u8) bool {
+    return std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '/' or ch == '=' or ch == '_' or ch == '-';
+}
+
+fn computeShannonEntropy(text: []const u8) f64 {
+    if (text.len == 0) return 0.0;
+
+    var counts = [_]usize{0} ** 256;
+    for (text) |ch| counts[ch] += 1;
+
+    const len_f: f64 = @floatFromInt(text.len);
+    var entropy: f64 = 0.0;
+    for (counts) |count| {
+        if (count == 0) continue;
+        const count_f: f64 = @floatFromInt(count);
+        const p = count_f / len_f;
+        entropy -= p * @log2(p);
+    }
+    return entropy;
+}
+
+fn looksLikeGitCommitHash(text: []const u8) bool {
+    if (text.len != 40) return false;
+    for (text) |ch| {
+        if (!std.ascii.isHex(ch)) return false;
+    }
+    return true;
+}
+
+fn looksLikeUuid(text: []const u8) bool {
+    if (text.len != 36) return false;
+    const dash_positions = [_]usize{ 8, 13, 18, 23 };
+    for (text, 0..) |ch, idx| {
+        var is_dash_pos = false;
+        for (dash_positions) |dash_idx| {
+            if (idx == dash_idx) {
+                is_dash_pos = true;
+                break;
+            }
+        }
+        if (is_dash_pos) {
+            if (ch != '-') return false;
+        } else if (!std.ascii.isHex(ch)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn startsWithIgnoreCase(text: []const u8, prefix: []const u8) bool {
+    if (prefix.len > text.len) return false;
+    return eqlIgnoreCase(text[0..prefix.len], prefix);
 }
 
 fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -1091,6 +1288,24 @@ test "workspace audit finds env secret assignment" {
     try std.testing.expectEqualStrings(".env", report.findings[0].path);
 }
 
+test "match secret assignment catches slack token key" {
+    const assignment = matchSecretAssignment("SLACK_TOKEN=xoxb1234567890abcdefghijklmnop").?;
+    try std.testing.expectEqualStrings("SLACK_TOKEN", assignment.key);
+    try std.testing.expect(assignment.keyword_score >= 3);
+}
+
+test "match secret assignment catches aws secret access key" {
+    const assignment = matchSecretAssignment("AWS_SECRET_ACCESS_KEY=demoSecretValue123456").?;
+    try std.testing.expectEqualStrings("AWS_SECRET_ACCESS_KEY", assignment.key);
+    try std.testing.expect(assignment.keyword_score >= 4);
+}
+
+test "match secret assignment catches aws access key id" {
+    const assignment = matchSecretAssignment("aws_access_key_id=AKIAIOSFODNN7EXAMPLE").?;
+    try std.testing.expectEqualStrings("aws_access_key_id", assignment.key);
+    try std.testing.expect(assignment.keyword_score >= 2);
+}
+
 test "workspace audit ignores code variable token assignment" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1138,7 +1353,7 @@ test "workspace audit only secrets hides medium findings" {
 
     try std_compat.fs.Dir.wrap(tmp.dir).writeFile(.{
         .sub_path = "notes.txt",
-        .data = "secret: abcdef1234567890\n",
+        .data = "internal_blob: ZXhhbXBsZVRva2VuQ2FuZGlkYXRlMTIzNDU2\n",
     });
 
     const workspace = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
@@ -1151,6 +1366,16 @@ test "workspace audit only secrets hides medium findings" {
     defer report.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 0), report.findings.len);
+}
+
+test "entropy detector finds custom candidate" {
+    const rule = detectLine("notes.txt", "opaque_blob=ZXhhbXBsZVRva2VuQ2FuZGlkYXRlMTIzNDU2", .workspace_file).?;
+    try std.testing.expectEqualStrings("high_entropy_secret_candidate", rule.rule);
+}
+
+test "entropy detector ignores git commit hash and uuid" {
+    try std.testing.expect(detectLine("notes.txt", "commit=0123456789abcdef0123456789abcdef01234567", .workspace_file) == null);
+    try std.testing.expect(detectLine("notes.txt", "id=123e4567-e89b-12d3-a456-426614174000", .workspace_file) == null);
 }
 
 test "workspace audit ignores vendored paths by default" {
