@@ -19,6 +19,7 @@ const log = std.log.scoped(.main);
 
 const Command = enum {
     agent,
+    acp,
     gateway,
     service,
     config,
@@ -64,6 +65,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\COMMANDS:
     \\  onboard      Initialize workspace and configuration
     \\  agent        Start the AI agent loop
+    \\  acp          Start Agent Client Protocol server (stdio JSON-RPC)
     \\  gateway      Start the gateway server (HTTP/WebSocket)
     \\  service      Manage OS service lifecycle
     \\  config       Inspect resolved config values
@@ -88,6 +90,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
     \\OPTIONS:
     \\  onboard [--interactive] [--api-key KEY] [--provider PROV] [--model MODEL] [--memory MEM]
     \\  agent [-m MESSAGE] [-s SESSION] [--provider PROVIDER] [--model MODEL] [--temperature TEMP] [--workspace PATH] [--skill SKILL]
+    \\  acp [--provider PROVIDER] [--model MODEL] [--temperature TEMP] [--agent NAME] [--skill NAME]
     \\  gateway [--port PORT] [--host HOST] [--workspace PATH]
     \\  status [--json]
     \\  version | --version | -V
@@ -127,6 +130,7 @@ const TOP_LEVEL_USAGE = std.fmt.comptimePrint(
 fn parseCommand(arg: []const u8) ?Command {
     const command_map = std.StaticStringMap(Command).initComptime(.{
         .{ "agent", .agent },
+        .{ "acp", .acp },
         .{ "gateway", .gateway },
         .{ "service", .service },
         .{ "config", .config },
@@ -228,6 +232,7 @@ pub fn main(init: std.process.Init) !void {
         } else {
             try yc.agent.run(allocator, sub_args);
         },
+        .acp => try yc.acp.run(allocator, sub_args),
         .onboard => try runOnboard(allocator, sub_args),
         .doctor => try runDoctorCommand(allocator, sub_args),
         .help => printUsage(),
@@ -373,7 +378,7 @@ fn printAgentUsage() void {
         \\Start the AI agent loop.
         \\
         \\OPTIONS:
-        \\  invoke --message MESSAGE [--session SESSION] [--skill SKILL] [--json]
+        \\  invoke --message MESSAGE [--session SESSION] [--workspace PATH] [--skill SKILL] [--json]
         \\                               Run one machine-readable agent turn
         \\  sessions list [--json]       List persisted agent sessions
         \\  sessions get <session> [--json]
@@ -529,6 +534,7 @@ const AgentInvokeForwardOptions = struct {
     model: ?[]const u8 = null,
     temperature: ?[]const u8 = null,
     agent_name: ?[]const u8 = null,
+    workspace: ?[]const u8 = null,
     skill_name: ?[]const u8 = null,
 };
 
@@ -560,6 +566,10 @@ fn appendAgentInvokeForwardArgs(
         try argv.append(allocator, "--agent");
         try argv.append(allocator, value);
     }
+    if (options.workspace) |value| {
+        try argv.append(allocator, "--workspace");
+        try argv.append(allocator, value);
+    }
     if (options.skill_name) |value| {
         try argv.append(allocator, "--skill");
         try argv.append(allocator, value);
@@ -573,6 +583,7 @@ fn runAgentInvokeJson(allocator: std.mem.Allocator, sub_args: []const []const u8
     var model: ?[]const u8 = null;
     var temperature: ?[]const u8 = null;
     var agent_name: ?[]const u8 = null;
+    var workspace: ?[]const u8 = null;
     var skill_name: ?[]const u8 = null;
     var json_mode = false;
 
@@ -621,6 +632,13 @@ fn runAgentInvokeJson(allocator: std.mem.Allocator, sub_args: []const []const u8
             }
             i += 1;
             agent_name = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "--workspace")) {
+            if (i + 1 >= sub_args.len) {
+                writeJsonError("bad_request", "Missing value for --workspace", null);
+                std_compat.process.exit(1);
+            }
+            i += 1;
+            workspace = sub_args[i];
         } else if (std.mem.eql(u8, arg, "--skill")) {
             if (i + 1 >= sub_args.len) {
                 writeJsonError("bad_request", "Missing value for --skill", null);
@@ -658,6 +676,7 @@ fn runAgentInvokeJson(allocator: std.mem.Allocator, sub_args: []const []const u8
         .model = model,
         .temperature = temperature,
         .agent_name = agent_name,
+        .workspace = workspace,
         .skill_name = skill_name,
     });
 
