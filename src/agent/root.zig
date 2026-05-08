@@ -10712,6 +10712,114 @@ test "Agent: redactor scrubs failed tool output in observer detail" {
     try std.testing.expect(std.mem.indexOf(u8, detail, "[EMAIL_1]") != null);
 }
 
+test "Agent: redactor scrubs successful tool output in next provider request" {
+    // Regression: a successful tool that emits raw PII must not leak that
+    // PII into the ChatRequest sent to the provider on the next iteration.
+    // The agent merges tool output into a user-role reflection message
+    // so this test concatenates every message
+    // content on the second hop and asserts nothing raw survives.
+    const PiiSuccessTool = struct {
+        const Self = @This();
+        pub const tool_name = "pii_success_probe";
+        pub const tool_description = "Returns a successful output containing PII for redaction regression testing.";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{
+                .success = true,
+                .output = try allocator.dupe(u8, "lookup ok: user@example.com"),
+            };
+        }
+    };
+
+    const ToolThenCaptureProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+        captured_concat: ?[]u8 = null,
+        capture_alloc: std.mem.Allocator,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-pii-success"),
+                    .name = try allocator.dupe(u8, "pii_success_probe"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "checking"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, model),
+                };
+            }
+            var concat: std.ArrayListUnmanaged(u8) = .empty;
+            defer concat.deinit(self.capture_alloc);
+            for (request.messages) |msg| {
+                try concat.appendSlice(self.capture_alloc, msg.content);
+                try concat.append(self.capture_alloc, '\n');
+            }
+            if (self.captured_concat) |old| self.capture_alloc.free(old);
+            self.captured_concat = try self.capture_alloc.dupe(u8, concat.items);
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "tool-then-capture";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ToolThenCaptureProvider.chatWithSystem,
+        .chat = ToolThenCaptureProvider.chat,
+        .supportsNativeTools = ToolThenCaptureProvider.supportsNativeTools,
+        .getName = ToolThenCaptureProvider.getName,
+        .deinit = ToolThenCaptureProvider.deinitFn,
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = ToolThenCaptureProvider{ .capture_alloc = allocator };
+    defer if (provider_state.captured_concat) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+    var tool_state = PiiSuccessTool{};
+    const tool = tool_state.tool();
+
+    var cfg = redactionBaseConfig(allocator);
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfigWithProfile(allocator, &cfg, provider, &.{tool}, null, noop.observer(), null);
+    defer agent.deinit();
+
+    const response = try agent.turn("run the success probe");
+    defer allocator.free(response);
+
+    try std.testing.expect(provider_state.captured_concat != null);
+    const captured = provider_state.captured_concat.?;
+    try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
+}
+
 test "Agent: redactor scrubs LLM response observer detail" {
     const RawEmailResponseProvider = struct {
         fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {

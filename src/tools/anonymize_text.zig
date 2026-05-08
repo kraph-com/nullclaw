@@ -333,3 +333,105 @@ test "anonymize_text: never leaks original sensitive substrings on success" {
     try std.testing.expect(std.mem.indexOf(u8, result.output, "[CARD_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "[TOKEN_1]") != null);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Negative security tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "anonymize_text: text param of wrong JSON type rejected without leak" {
+    // Regression: a non-string `text` (here: integer) must fail closed via the
+    // missing-parameter path; the tool must not panic, leak, or echo the value.
+    var at = AnonymizeTextTool{};
+    const t = at.tool();
+    const parsed = try root.parseTestArgs("{\"text\":42}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "42") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "text") != null);
+}
+
+test "anonymize_text: redact_email with non-bool type falls back to default-on" {
+    // Regression: type-confusion via `"redact_email":"false"` (string, not bool)
+    // must not silently disable redaction — defaults stay enabled.
+    var at = AnonymizeTextTool{};
+    const t = at.tool();
+    const parsed = try root.parseTestArgs(
+        "{\"text\":\"contact a@b.co\",\"redact_email\":\"false\"}",
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "a@b.co") == null);
+    try std.testing.expectEqualStrings("contact [EMAIL_1]", result.output);
+}
+
+test "anonymize_text: input exactly at MAX_INPUT_BYTES accepted" {
+    // Regression: off-by-one on the size guard would either reject valid input
+    // or accept oversized input. Lock both edges of the boundary.
+    const allocator = std.testing.allocator;
+    const filler = try allocator.alloc(u8, MAX_INPUT_BYTES);
+    defer allocator.free(filler);
+    @memset(filler, 'a');
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var obj: JsonObjectMap = .empty;
+    try obj.put(arena_alloc, "text", .{ .string = filler });
+
+    var at = AnonymizeTextTool{};
+    const t = at.tool();
+    const result = try t.execute(allocator, obj);
+    defer allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqual(@as(usize, MAX_INPUT_BYTES), result.output.len);
+}
+
+test "anonymize_text: high-cardinality input redacts every unique value" {
+    // Regression: many unique values must each get a placeholder and none of
+    // them must survive verbatim in the output.
+    var at = AnonymizeTextTool{};
+    const t = at.tool();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try buf.appendSlice(std.testing.allocator, "{\"text\":\"");
+    var i: usize = 0;
+    while (i < 25) : (i += 1) {
+        var line_buf: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&line_buf, "user{d}@example.com\\n", .{i});
+        try buf.appendSlice(std.testing.allocator, line);
+    }
+    try buf.appendSlice(std.testing.allocator, "\"}");
+
+    const parsed = try root.parseTestArgs(buf.items);
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+
+    i = 0;
+    while (i < 25) : (i += 1) {
+        var needle_buf: [64]u8 = undefined;
+        const needle = try std.fmt.bufPrint(&needle_buf, "user{d}@example.com", .{i});
+        try std.testing.expect(std.mem.indexOf(u8, result.output, needle) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[EMAIL_25]") != null);
+}
+
+test "anonymize_text: parametersJson advertises every redact_* flag" {
+    // Regression: tool schema and execute() config must stay in lockstep so
+    // models can actually reach every category-disable flag.
+    var at = AnonymizeTextTool{};
+    const t = at.tool();
+    const params = t.parametersJson();
+    try std.testing.expect(std.mem.indexOf(u8, params, "redact_email") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "redact_phone") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "redact_card") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "redact_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, params, "redact_tokens") != null);
+}

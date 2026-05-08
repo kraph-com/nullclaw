@@ -795,6 +795,180 @@ test "sqlite_query: max_bytes cap rolls back oversized row" {
     try std.testing.expect(result.output.len < 2048);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Negative security tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "sqlite_query: rejects DELETE" {
+    // Regression: parallel coverage to INSERT/UPDATE/DROP via the execute path,
+    // not just the classifier unit test. Locks the tool surface.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"DELETE FROM u WHERE id=1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "sqlite_query: rejects CREATE TABLE via execute" {
+    // Regression: classifier rejects CREATE in unit tests; this locks the same
+    // behavior at the public tool surface.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"CREATE TABLE evil (x INT)\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "sqlite_query: lowercase write keywords rejected" {
+    // Regression: case-insensitivity must hold at the tool surface, not only
+    // in classifier unit tests. `delete from ...` would slip through a naive
+    // case-sensitive matcher.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"delete from u where id=1\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "sqlite_query: comment-prefixed write rejected" {
+    // Regression: a leading SQL comment must not let an attacker hide a write
+    // statement from the classifier (`-- innocent\nDROP TABLE u`).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs(
+        "{\"db_path\":\"test.db\",\"query\":\"-- innocent looking comment\\nDROP TABLE u\"}",
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "sqlite_query: block-comment-prefixed write rejected" {
+    // Regression: same as above but with `/* ... */` block comments.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs(
+        "{\"db_path\":\"test.db\",\"query\":\"/* SELECT-ish */ INSERT INTO u (name) VALUES ('mallory')\"}",
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "sqlite_query: empty query rejected via execute" {
+    // Regression: classifier rejects empty/whitespace-only input; verify the
+    // failure surfaces through the public tool API too.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs("{\"db_path\":\"test.db\",\"query\":\"   \\n\\t  \"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "empty query") != null);
+}
+
+test "sqlite_query: db_path with embedded null byte rejected" {
+    // Regression: a null byte must not survive path_security.isPathSafe and
+    // reach sqlite3_open. JsonObjectMap is built directly to avoid relying on
+    // std.json's handling of `\u0000` escapes.
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    var obj: JsonObjectMap = .empty;
+    try obj.put(arena_alloc, "db_path", .{ .string = "safe\x00.db" });
+    try obj.put(arena_alloc, "query", .{ .string = "SELECT 1" });
+
+    var sqt = SqliteQueryTool{ .workspace_dir = "/tmp/yc_test_sqlite_query_nul" };
+    const t = sqt.tool();
+    const result = try t.execute(allocator, obj);
+    defer allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "safety check") != null);
+}
+
+test "sqlite_query: max_rows of wrong JSON type ignored, defaults applied" {
+    // Regression: if a model passes `"max_rows":"100"` (string), getInt returns
+    // null and the tool must fall back to its configured default rather than
+    // crashing or running unbounded.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const ws_path = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(ws_path);
+    const db_path_z = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/test.db", .{ws_path}, 0);
+    defer std.testing.allocator.free(db_path_z);
+    try TestDb.populate(db_path_z.ptr);
+
+    var sqt = SqliteQueryTool{ .workspace_dir = ws_path, .max_result_rows = 10 };
+    const t = sqt.tool();
+    const parsed = try root.parseTestArgs(
+        "{\"db_path\":\"test.db\",\"query\":\"SELECT id FROM u\",\"max_rows\":\"100\"}",
+    );
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "\"row_count\":3") != null);
+}
+
 test "sqlite_query: symlink escape (db_path → outside workspace) rejected" {
     // Defense via realpath + isResolvedPathAllowed: a workspace-relative
     // symlink that points outside the workspace must not let the agent read
