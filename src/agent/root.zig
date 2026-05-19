@@ -3626,20 +3626,33 @@ pub const Agent = struct {
         for (parts, 0..) |p, i| {
             out[i] = switch (p) {
                 .text => |t| ContentPart{ .text = try redactor.redact(arena, t) },
-                .image_url => |img| ContentPart{ .image_url = .{
-                    .url = try redactor.redact(arena, stripUrlQueryFragment(img.url)),
-                    .detail = img.detail,
-                } },
+                .image_url => |img| try redactImageUrlPart(arena, img, redactor),
                 .image_base64 => p,
             };
         }
         return out;
     }
 
-    fn stripUrlQueryFragment(url: []const u8) []const u8 {
-        const query_pos = std.mem.indexOfScalar(u8, url, '?') orelse url.len;
-        const fragment_pos = std.mem.indexOfScalar(u8, url, '#') orelse url.len;
-        return url[0..@min(query_pos, fragment_pos)];
+    fn redactImageUrlPart(
+        arena: std.mem.Allocator,
+        img: ContentPart.ImageUrl,
+        redactor: *redaction.Redactor,
+    ) !ContentPart {
+        if (urlHasQueryOrFragment(img.url)) {
+            return ContentPart{ .text = "[Remote image URL not sent to provider: query/fragment credentials are not forwarded]" };
+        }
+        if (redactor.wouldRedact(img.url)) {
+            return ContentPart{ .text = "[Remote image URL not sent to provider: URL contains sensitive data]" };
+        }
+        return ContentPart{ .image_url = .{
+            .url = try redactor.redact(arena, img.url),
+            .detail = img.detail,
+        } };
+    }
+
+    fn urlHasQueryOrFragment(url: []const u8) bool {
+        return std.mem.indexOfScalar(u8, url, '?') != null or
+            std.mem.indexOfScalar(u8, url, '#') != null;
     }
 
     fn appendMultimodalAllowedDir(
@@ -11159,9 +11172,11 @@ test "Agent: response cache bypasses redacted prompt placeholders" {
     try std.testing.expectEqual(@as(u32, 2), provider_state.calls);
 }
 
-test "Agent.redactMessagesForProvider redacts multimodal text and strips image URL queries" {
+test "Agent.redactMessagesForProvider redacts multimodal text and drops unsafe image URLs" {
     // Direct unit test on the helper: text content_parts and image URLs get
-    // scrubbed before provider handoff. Query/fragment credentials are stripped.
+    // scrubbed before provider handoff. Query/fragment URLs are not forwarded:
+    // stripping them would send a broken signed URL while forwarding leaks
+    // credentials.
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -11193,15 +11208,35 @@ test "Agent.redactMessagesForProvider redacts multimodal text and strips image U
     try std.testing.expect(std.mem.indexOf(u8, out_parts[0].text, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_parts[0].text, "a@b.co") == null);
 
-    // Image URL query/fragment content is dropped and path content is redacted
-    // before provider handoff.
-    try std.testing.expect(std.meta.activeTag(out_parts[1]) == .image_url);
-    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "abc123") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "deadbeef") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "?") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "#") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "user@example.com") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].image_url.url, "[EMAIL_2]") != null);
+    // Signed/query URLs are replaced by an explicit provider note instead of a
+    // broken redacted URL.
+    try std.testing.expect(std.meta.activeTag(out_parts[1]) == .text);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].text, "not sent to provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].text, "abc123") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].text, "deadbeef") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out_parts[1].text, "user@example.com") == null);
+}
+
+test "Agent.redactMessagesForProvider preserves safe image URLs" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var redactor = redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+
+    const parts = [_]ContentPart{
+        ContentPart{ .image_url = .{ .url = "https://cdn.example.com/public/cat.png" } },
+    };
+    const messages = [_]ChatMessage{
+        ChatMessage{ .role = .user, .content = "", .content_parts = &parts },
+    };
+
+    const out = try Agent.redactMessagesForProvider(arena.allocator(), &messages, &redactor);
+    const out_parts = out[0].content_parts.?;
+    try std.testing.expectEqual(@as(usize, 1), out_parts.len);
+    try std.testing.expect(std.meta.activeTag(out_parts[0]) == .image_url);
+    try std.testing.expectEqualStrings("https://cdn.example.com/public/cat.png", out_parts[0].image_url.url);
 }
 
 test "Agent.executeTool does not rehydrate redactor placeholders in tool args" {
@@ -11283,12 +11318,10 @@ test "Agent.executeTool does not rehydrate redactor placeholders in tool args" {
     );
 }
 
-test "Agent: redactor placeholder from image_url rehydrates in CLI display path" {
-    // Regression: redactMessagesForProvider feeds image_url.url through the
-    // same Redactor as text content, so any token captured from a URL must
-    // round-trip via the same reverse map. Emulate the "image URL captured ->
-    // LLM echoed placeholder -> display unredact" round-trip directly through
-    // the Redactor (the CLI print path is just `redactor.unredact(response)`).
+test "Agent: signed image_url is not forwarded as a broken redacted URL" {
+    // Regression: stripping query credentials from a signed URL protects
+    // secrets but leaves the provider with a URL that cannot fetch the image.
+    // The governed path must send an explicit text note instead.
     const allocator = std.testing.allocator;
     var redactor = redaction.Redactor.init(allocator, .{ .record_originals = true });
     defer redactor.deinit();
@@ -11304,15 +11337,11 @@ test "Agent: redactor placeholder from image_url rehydrates in CLI display path"
     };
     const out = try Agent.redactMessagesForProvider(arena.allocator(), &messages, &redactor);
     try std.testing.expect(out[0].content_parts != null);
-    const redacted_url = out[0].content_parts.?[0].image_url.url;
-    try std.testing.expect(std.mem.indexOf(u8, redacted_url, "[EMAIL_1]") != null);
-
-    // Simulate LLM echoing the placeholder it saw in the URL.
-    const llm_reply = "I noticed an email at [EMAIL_1] in the image URL.";
-    const restored = try redactor.unredact(allocator, llm_reply);
-    defer allocator.free(restored);
-    try std.testing.expect(std.mem.indexOf(u8, restored, "user@example.com") != null);
-    try std.testing.expect(std.mem.indexOf(u8, restored, "[EMAIL_1]") == null);
+    const part = out[0].content_parts.?[0];
+    try std.testing.expect(std.meta.activeTag(part) == .text);
+    try std.testing.expect(std.mem.indexOf(u8, part.text, "not sent to provider") != null);
+    try std.testing.expect(std.mem.indexOf(u8, part.text, "raw-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, part.text, "user@example.com") == null);
 }
 
 // ---- iteration-exhausted summary path ----

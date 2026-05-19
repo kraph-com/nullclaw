@@ -7,7 +7,8 @@
 //!
 //! Stateful: same value within or across `redact()` calls reuses the same id.
 //! Identity maps (`email_map`, …) key plaintext fingerprints by HMAC-SHA256
-//! and never store the original value, so the default mode is one-way.
+//! and never store the original value, so the default mode is one-way. The maps
+//! are bounded; once the cap is reached, new identities collapse to KIND_0.
 //!
 //! `Config.record_originals = true` opts the redactor into a parallel
 //! `placeholder_to_original` reverse map that retains plaintext PII for the
@@ -34,6 +35,11 @@ pub const Config = struct {
     /// Upper bound for plaintext originals retained for display rehydration.
     /// Once the cap is reached, new placeholders remain one-way.
     max_originals: u32 = 1024,
+    /// Upper bound for HMAC identity fingerprints retained by this Redactor.
+    /// Existing identities keep their stable ids. New identities beyond the cap
+    /// redact to KIND_0 without adding map entries, preserving privacy while
+    /// bounding memory in long-lived sessions.
+    max_identity_entries: u32 = 1024,
 };
 
 pub const Redactor = struct {
@@ -230,12 +236,24 @@ pub const Redactor = struct {
         const fingerprint = std.fmt.bytesToHex(digest, .lower);
 
         if (map.get(fingerprint[0..])) |existing| return existing;
+        if (self.config.max_identity_entries == 0 or self.identityEntryCount() >= self.config.max_identity_entries) {
+            return 0;
+        }
         const key_dup = try self.allocator.dupe(u8, fingerprint[0..]);
         errdefer self.allocator.free(key_dup);
         const new_id = counter.* + 1;
         try map.put(key_dup, new_id);
         counter.* = new_id;
         return new_id;
+    }
+
+    fn identityEntryCount(self: *const Redactor) u32 {
+        const total = self.email_map.count() +
+            self.phone_map.count() +
+            self.card_map.count() +
+            self.id_map.count() +
+            self.token_map.count();
+        return @intCast(@min(total, std.math.maxInt(u32)));
     }
 
     /// Cache the original PII slice under "[KIND_<id>]" so unredact() can
@@ -254,6 +272,7 @@ pub const Redactor = struct {
     /// id already interned (same fingerprint) and re-records the original.
     fn recordOriginal(self: *Redactor, kind: []const u8, id: u32, original: []const u8) !void {
         if (!self.config.record_originals) return;
+        if (id == 0) return;
 
         var key_buf: [32]u8 = undefined;
         const key_slice = try std.fmt.bufPrint(&key_buf, "[{s}_{d}]", .{ kind, id });
@@ -1133,6 +1152,31 @@ test "unredact: max_originals bounds reverse map" {
     const restored = try r.unredact(allocator, redacted);
     defer allocator.free(restored);
     try std.testing.expectEqualStrings("one a@b.co two [EMAIL_2]", restored);
+}
+
+test "Redactor max_identity_entries bounds placeholder maps" {
+    // Regression: long-lived governance sessions must not grow HMAC identity
+    // maps without bound under high-cardinality PII input.
+    const allocator = std.testing.allocator;
+    var r = Redactor.init(allocator, .{ .record_originals = true, .max_identity_entries = 1 });
+    defer r.deinit();
+
+    const first = try r.redact(allocator, "one a@b.co");
+    defer allocator.free(first);
+    try std.testing.expectEqualStrings("one [EMAIL_1]", first);
+
+    const second = try r.redact(allocator, "two x@y.zz");
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings("two [EMAIL_0]", second);
+    try std.testing.expectEqual(@as(u32, 1), r.identityEntryCount());
+
+    const repeated = try r.redact(allocator, "again a@b.co");
+    defer allocator.free(repeated);
+    try std.testing.expectEqualStrings("again [EMAIL_1]", repeated);
+
+    const restored = try r.unredact(allocator, "known [EMAIL_1] capped [EMAIL_0]");
+    defer allocator.free(restored);
+    try std.testing.expectEqualStrings("known a@b.co capped [EMAIL_0]", restored);
 }
 
 test "matchPlaceholderEnd: covers all kinds and rejects look-alikes" {

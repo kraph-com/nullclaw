@@ -2200,6 +2200,8 @@ const MemoryExportOptions = struct {
     include_pii: bool = false,
 };
 
+const MEMORY_EXPORT_STREAM_CHUNK_SIZE: usize = 64;
+
 const DuplicateStats = struct {
     groups: usize = 0,
     extra_entries: usize = 0,
@@ -2254,11 +2256,12 @@ fn writeRedactedMemoryExportEntryJson(
     try writeMemoryExportEntryJson(out, entry, redacted_key, redacted_content, redacted_session_id);
 }
 
-fn appendMemoryExportJsonl(
+fn writeMemoryExportJsonlEntries(
     out: anytype,
     allocator: std.mem.Allocator,
     entries: []const yc.memory.MemoryEntry,
     include_pii: bool,
+    redactor: ?*yc.redaction.Redactor,
 ) !void {
     if (include_pii) {
         for (entries) |entry| {
@@ -2266,13 +2269,66 @@ fn appendMemoryExportJsonl(
             try out.writeByte('\n');
         }
     } else {
-        var redactor = yc.redaction.Redactor.init(allocator, .{});
-        defer redactor.deinit();
+        const r = redactor orelse return error.InvalidRedactor;
         for (entries) |entry| {
-            try writeRedactedMemoryExportEntryJson(out, allocator, &redactor, entry);
+            try writeRedactedMemoryExportEntryJson(out, allocator, r, entry);
             try out.writeByte('\n');
         }
     }
+}
+
+fn writeMemoryExportJsonlStream(
+    allocator: std.mem.Allocator,
+    out: anytype,
+    mem: yc.memory.Memory,
+    options: MemoryExportOptions,
+) !void {
+    var redactor = yc.redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+
+    var written: usize = 0;
+    var page_offset = options.offset;
+    while (written < options.limit) {
+        const take = @min(MEMORY_EXPORT_STREAM_CHUNK_SIZE, options.limit - written);
+        if (take == 0) break;
+
+        const page_len = blk: {
+            const entries = try loadMemoryListPage(
+                allocator,
+                mem,
+                options.category,
+                options.session_id,
+                take,
+                page_offset,
+                options.include_internal,
+            );
+            defer yc.memory.freeEntries(allocator, entries);
+
+            if (entries.len == 0) break :blk 0;
+            try writeMemoryExportJsonlEntries(
+                out,
+                allocator,
+                entries,
+                options.include_pii,
+                if (options.include_pii) null else &redactor,
+            );
+            break :blk entries.len;
+        };
+
+        if (page_len == 0) break;
+        written += page_len;
+        page_offset += page_len;
+        if (page_len < take) break;
+    }
+}
+
+fn appendMemoryExportJsonl(
+    out: anytype,
+    allocator: std.mem.Allocator,
+    mem: yc.memory.Memory,
+    options: MemoryExportOptions,
+) !void {
+    try writeMemoryExportJsonlStream(allocator, out, mem, options);
 }
 
 fn buildMemoryExportJsonl(
@@ -2280,18 +2336,18 @@ fn buildMemoryExportJsonl(
     mem: yc.memory.Memory,
     options: MemoryExportOptions,
 ) ![]u8 {
-    const entries = try loadMemoryListPage(
-        allocator,
-        mem,
-        options.category,
-        options.session_id,
-        options.limit,
-        options.offset,
-        options.include_internal,
-    );
-    defer yc.memory.freeEntries(allocator, entries);
+    return yc.admin_output.renderBytes(allocator, appendMemoryExportJsonl, .{ allocator, mem, options });
+}
 
-    return yc.admin_output.renderBytes(allocator, appendMemoryExportJsonl, .{ allocator, entries, options.include_pii });
+fn writeMemoryExportJsonlStdout(
+    allocator: std.mem.Allocator,
+    mem: yc.memory.Memory,
+    options: MemoryExportOptions,
+) !void {
+    var stdout_buf: [4096]u8 = undefined;
+    var bw = std_compat.fs.File.stdout().writer(&stdout_buf);
+    try writeMemoryExportJsonlStream(allocator, &bw.interface, mem, options);
+    try bw.interface.flush();
 }
 
 fn freeStringUsizeMap(map: *std.StringHashMapUnmanaged(usize), allocator: std.mem.Allocator) void {
@@ -3005,12 +3061,10 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             }
         }
 
-        const jsonl = buildMemoryExportJsonl(allocator, mem_rt.memory, options) catch |err| {
+        writeMemoryExportJsonlStdout(allocator, mem_rt.memory, options) catch |err| {
             std.debug.print("memory export-jsonl failed: {s}\n", .{@errorName(err)});
             std_compat.process.exit(1);
         };
-        defer allocator.free(jsonl);
-        printStdoutBytes(jsonl);
         return;
     }
 
@@ -6447,6 +6501,114 @@ test "loadMemoryListPage skips internal entries before applying visible offset" 
 
     try std.testing.expectEqual(@as(usize, 1), page.len);
     try std.testing.expectEqualStrings("visible-2", page[0].key);
+}
+
+test "writeMemoryExportJsonlStream uses bounded pages" {
+    const StreamMemory = struct {
+        count: usize = 70,
+        calls: usize = 0,
+        max_limit_seen: usize = 0,
+
+        fn makeEntry(allocator: std.mem.Allocator, idx: usize) !yc.memory.MemoryEntry {
+            const key = try std.fmt.allocPrint(allocator, "visible-{d}", .{idx});
+            errdefer allocator.free(key);
+            const id = try allocator.dupe(u8, key);
+            errdefer allocator.free(id);
+            const content = try std.fmt.allocPrint(allocator, "content-{d}", .{idx});
+            errdefer allocator.free(content);
+            const timestamp = try allocator.dupe(u8, "2026-04-17T00:00:00Z");
+            errdefer allocator.free(timestamp);
+            return .{
+                .id = id,
+                .key = key,
+                .category = .conversation,
+                .timestamp = timestamp,
+                .content = content,
+                .session_id = null,
+            };
+        }
+
+        fn implName(_: *anyopaque) []const u8 {
+            return "stream-paged";
+        }
+
+        fn implStore(_: *anyopaque, _: []const u8, _: []const u8, _: yc.memory.MemoryCategory, _: ?[]const u8) anyerror!void {}
+
+        fn implRecall(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8, _: usize, _: ?[]const u8) anyerror![]yc.memory.MemoryEntry {
+            return allocator.alloc(yc.memory.MemoryEntry, 0);
+        }
+
+        fn implGet(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror!?yc.memory.MemoryEntry {
+            return null;
+        }
+
+        fn implList(_: *anyopaque, allocator: std.mem.Allocator, _: ?yc.memory.MemoryCategory, _: ?[]const u8) anyerror![]yc.memory.MemoryEntry {
+            return allocator.alloc(yc.memory.MemoryEntry, 0);
+        }
+
+        fn implListPaged(ptr: *anyopaque, allocator: std.mem.Allocator, _: ?yc.memory.MemoryCategory, _: ?[]const u8, limit: usize, offset: usize) anyerror![]yc.memory.MemoryEntry {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.max_limit_seen = @max(self.max_limit_seen, limit);
+
+            if (offset >= self.count) return allocator.alloc(yc.memory.MemoryEntry, 0);
+            const end = @min(self.count, offset + limit);
+            var entries = try allocator.alloc(yc.memory.MemoryEntry, end - offset);
+            var init_count: usize = 0;
+            errdefer {
+                for (entries[0..init_count]) |*entry| entry.deinit(allocator);
+                allocator.free(entries);
+            }
+            for (entries, 0..) |*entry, idx| {
+                entry.* = try makeEntry(allocator, offset + idx);
+                init_count += 1;
+            }
+            return entries;
+        }
+
+        fn implForget(_: *anyopaque, _: []const u8) anyerror!bool {
+            return false;
+        }
+
+        fn implCount(ptr: *anyopaque) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.count;
+        }
+
+        fn implHealthCheck(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn implDeinit(_: *anyopaque) void {}
+
+        const vtable = yc.memory.Memory.VTable{
+            .name = &implName,
+            .store = &implStore,
+            .recall = &implRecall,
+            .get = &implGet,
+            .list = &implList,
+            .listPaged = &implListPaged,
+            .forget = &implForget,
+            .count = &implCount,
+            .healthCheck = &implHealthCheck,
+            .deinit = &implDeinit,
+        };
+    };
+
+    var state = StreamMemory{};
+    const mem = yc.memory.Memory{ .ptr = @ptrCast(&state), .vtable = &StreamMemory.vtable };
+
+    var buf: [16_384]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try writeMemoryExportJsonlStream(std.testing.allocator, &writer, mem, .{
+        .limit = 70,
+        .include_pii = true,
+    });
+
+    try std.testing.expect(state.calls >= 2);
+    try std.testing.expect(state.max_limit_seen <= MEMORY_EXPORT_STREAM_CHUNK_SIZE);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"key\":\"visible-69\"") != null);
+    try std.testing.expect(std.mem.endsWith(u8, writer.buffered(), "\n"));
 }
 
 test "buildMemoryExportJsonl redacts PII and excludes internal entries by default" {
