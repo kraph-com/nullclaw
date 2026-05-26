@@ -19,10 +19,20 @@ jobs:
       binary_name: nullclaw
       artifact_prefix: nullclaw
       publish_docker: true
-      # Build with every memory engine compiled in (sqlite, postgres,
-      # redis, lucid, hybrid, api, markdown, …) so hosted-NullClaw
-      # operators can pick the backend at config-time without rebuilding.
-      # Upstream's prebuilt releases omit postgres which breaks the
-      # "use the customer's Kraph instance Postgres as the memory store"
-      # flow; this kraph-com fork ships all backends.
-      build_args: "-Dengines=all"
+      # Engine selection: the `postgres` engine does
+      # `linkSystemLibrary("pq")` (build.zig:528) which can't
+      # cross-compile to musl/android/riscv/windows — that's why
+      # `-Dengines=all` failed every target. We ship the upstream-proven
+      # non-native engine set instead. sqlite gives hosted sidecars
+      # persistent per-instance memory + summarizer (lives in the
+      # /data volume, runs on the Alpine sidecar). The `api` engine
+      # (pure HTTP, no native lib) is the path to "customer's own
+      # Postgres" later via the instance PostgREST endpoint — no rebuild
+      # needed. redis/lancedb/clickhouse/kg/lucid omitted (native deps
+      # we don't need).
+      build_args: "-Dengines=base,sqlite,markdown,api,hybrid"
+      # We only deploy linux-x86_64 / linux-aarch64 sidecars (Alpine →
+      # musl). Restricting the matrix drops the exotic targets we never
+      # ship and cuts build time + failure surface.
+      targets_json: >-
+        [{"os":"ubuntu-latest","target":"linux-x86_64","zig_target":"x86_64-linux-musl","zig_cpu":"","ext":""},{"os":"ubuntu-latest","target":"linux-aarch64","zig_target":"aarch64-linux-musl","zig_cpu":"","ext":""}]
