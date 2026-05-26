@@ -30,7 +30,7 @@ jobs:
       # Postgres" later via the instance PostgREST endpoint — no rebuild
       # needed. redis/lancedb/clickhouse/kg/lucid omitted (native deps
       # we don't need).
-      build_args: "-Dengines=base,sqlite,markdown,api,hybrid"
+      build_args: "-Dengines=base,sqlite,markdown,api,memory"
       # We only deploy linux-x86_64 / linux-aarch64 sidecars (Alpine →
       # musl). Restricting the matrix drops the exotic targets we never
       # ship and cuts build time + failure surface.

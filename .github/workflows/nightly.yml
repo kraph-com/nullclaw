@@ -34,6 +34,6 @@ jobs:
       # See release.yml for rationale — non-native engine set only
       # (postgres/redis/etc. link system libs that break cross-compile),
       # restricted to the linux musl targets we actually deploy.
-      build_args: "-Dengines=base,sqlite,markdown,api,hybrid"
+      build_args: "-Dengines=base,sqlite,markdown,api,memory"
       targets_json: >-
         [{"os":"ubuntu-latest","target":"linux-x86_64","zig_target":"x86_64-linux-musl","zig_cpu":"","ext":""},{"os":"ubuntu-latest","target":"linux-aarch64","zig_target":"aarch64-linux-musl","zig_cpu":"","ext":""}]
