@@ -2712,6 +2712,21 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                 }
             }
+            // session.mode = "cowork" | "assistant" — controls whether
+            // group/channel surfaces pool members into one session
+            // (cowork, default) or give each member a private lane
+            // (assistant). Unknown values silently default to .cowork.
+            // DMs are unaffected (always per-user via dm_scope above).
+            if (sess.object.get("mode")) |mode_val| {
+                if (mode_val == .string) {
+                    const s = mode_val.string;
+                    if (std.mem.eql(u8, s, "assistant")) {
+                        self.session.mode = .assistant;
+                    } else if (std.mem.eql(u8, s, "cowork")) {
+                        self.session.mode = .cowork;
+                    }
+                }
+            }
             const idle_val = sess.object.get("idle_minutes");
             if (idle_val) |v| {
                 if (v == .integer) self.session.idle_minutes = @intCast(v.integer);

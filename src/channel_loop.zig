@@ -505,6 +505,11 @@ fn resolveTelegramBaseRouteKey(
     peer_id: []const u8,
     thread_id: ?i64,
     is_group: bool,
+    // For `assistant` SessionMode in group chats: identifies the
+    // individual member who sent the message so each gets a private
+    // session lane. Pass `null` for direct chats (DMs are inherently
+    // per-user) or when the caller doesn't have it.
+    sender_id: ?[]const u8,
 ) ![]const u8 {
     const peer_kind: agent_routing.ChatType = if (is_group) .group else .direct;
     var topic_peer_id: ?[]u8 = null;
@@ -519,11 +524,13 @@ fn resolveTelegramBaseRouteKey(
                 topic_peer_id = try std.fmt.allocPrint(allocator, "{s}:thread:{d}", .{ peer_id, thread_id.? });
                 break :blk topic_peer_id.?;
             } else peer_id,
+            .sender_id = if (is_group) sender_id else null,
         },
         .parent_peer = if (is_group and thread_id != null)
             .{
                 .kind = peer_kind,
                 .id = peer_id,
+                .sender_id = sender_id,
             }
         else
             null,
@@ -538,8 +545,12 @@ fn resolveTelegramBaseRouteKey(
         .{
             .kind = peer_kind,
             .id = peer_id,
+            // sender_id wired in by the Telegram inbound update handler;
+            // see resolveRouteForTelegram* caller signature.
+            .sender_id = sender_id,
         },
         config.session.dm_scope,
+        config.session.mode,
         account_id,
         config.session.identity_links,
     );
@@ -599,7 +610,11 @@ pub fn resolveTelegramSessionKey(
     const base_peer_id = if (is_group) telegram.targetChatId(sender) else sender;
     const thread_id = if (is_group) telegram.targetThreadId(sender) else null;
 
-    const canonical_base = resolveTelegramBaseRouteKey(allocator, config, account_id, base_peer_id, thread_id, is_group) catch
+    // sender_id propagation from inbound updates is a Phase A.2 follow-up;
+    // for now we pass null so cowork mode behaves identically to before
+    // this change. With null sender_id, assistant mode falls back to the
+    // cowork key shape per buildSessionKeyWithScope semantics.
+    const canonical_base = resolveTelegramBaseRouteKey(allocator, config, account_id, base_peer_id, thread_id, is_group, null) catch
         try buildTelegramFallbackSessionKey(allocator, account_id, base_peer_id, null);
     const legacy_key: ?[]u8 = if (thread_id) |tid|
         try buildLegacyTelegramTopicSessionKey(allocator, canonical_base, tid)
@@ -2731,7 +2746,7 @@ test "resolveTelegramBaseRouteKey matches topic-specific telegram binding before
         .agent_bindings = &bindings,
     };
 
-    const key = try resolveTelegramBaseRouteKey(allocator, &cfg, "main", "-100123", 77, true);
+    const key = try resolveTelegramBaseRouteKey(allocator, &cfg, "main", "-100123", 77, true, null);
     defer allocator.free(key);
 
     try std.testing.expectEqualStrings("agent:topic-agent:telegram:group:-100123", key);
@@ -2759,7 +2774,7 @@ test "resolveTelegramBaseRouteKey falls back to base telegram group binding for 
         .agent_bindings = &bindings,
     };
 
-    const key = try resolveTelegramBaseRouteKey(allocator, &cfg, "main", "-100123", 77, true);
+    const key = try resolveTelegramBaseRouteKey(allocator, &cfg, "main", "-100123", 77, true, null);
     defer allocator.free(key);
 
     try std.testing.expectEqualStrings("agent:group-agent:telegram:group:-100123", key);
@@ -2776,7 +2791,7 @@ test "resolveTelegramBaseRouteKey auto-provisions direct telegram peers" {
         },
     };
 
-    const key = try resolveTelegramBaseRouteKey(allocator, &cfg, "main", "123456", null, false);
+    const key = try resolveTelegramBaseRouteKey(allocator, &cfg, "main", "123456", null, false, null);
     defer allocator.free(key);
 
     try std.testing.expect(std.mem.startsWith(u8, key, "agent:peer-"));

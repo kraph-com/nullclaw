@@ -1893,6 +1893,24 @@ pub const DmScope = enum {
     per_account_channel_peer,
 };
 
+/// Session-scoping behavior for group/channel surfaces (Slack channels,
+/// Telegram groups, Discord channels, etc.).
+///
+/// - `cowork` (default): one session per channel — every member shares
+///   memory + conversation history. Good for "the team builds a thing
+///   together with one shared agent".
+///
+/// - `assistant`: one session per (channel, sender) — each member gets a
+///   private memory + history lane in the same channel. Good for
+///   "shared bot, private context per person".
+///
+/// DMs (peer.kind == .direct) are unaffected — they're always per-user
+/// by definition regardless of mode.
+pub const SessionMode = enum {
+    cowork,
+    assistant,
+};
+
 pub const IdentityLink = struct {
     canonical: []const u8,
     peers: []const []const u8 = &.{},
@@ -1900,6 +1918,11 @@ pub const IdentityLink = struct {
 
 pub const SessionConfig = struct {
     dm_scope: DmScope = .per_channel_peer,
+    /// Group/channel session-scoping mode. Default `.cowork` matches
+    /// historical behavior (all members of a group share one session).
+    /// Set `.assistant` to give each member their own private session
+    /// lane in the same channel. See SessionMode docs.
+    mode: SessionMode = .cowork,
     idle_minutes: u32 = 60,
     identity_links: []const IdentityLink = &.{},
     /// Automatically route direct messages from unknown peers into deterministic

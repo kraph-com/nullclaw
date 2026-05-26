@@ -30,6 +30,13 @@ pub const ChatType = enum {
 pub const PeerRef = struct {
     kind: ChatType,
     id: []const u8,
+    /// For group/channel kinds, the individual member's user ID. Only
+    /// consulted when SessionMode == .assistant — adds `:peer:<sender_id>`
+    /// to the session_key so each member of a shared channel gets a
+    /// private session lane. Ignored for direct kind (DMs are inherently
+    /// per-user). Pass `null` from channel handlers that don't yet
+    /// thread the sender — they get cowork behavior regardless of mode.
+    sender_id: ?[]const u8 = null,
 };
 
 pub const BindingMatch = struct {
@@ -145,16 +152,24 @@ pub fn buildSessionKey(
     channel: []const u8,
     peer: ?PeerRef,
 ) ![]u8 {
-    return buildSessionKeyWithScope(allocator, agent_id, channel, peer, .per_channel_peer, null, &.{});
+    return buildSessionKeyWithScope(allocator, agent_id, channel, peer, .per_channel_peer, .cowork, null, &.{});
 }
 
-/// Build a session key respecting DmScope and identity links.
+/// Build a session key respecting DmScope, SessionMode and identity links.
+///
+/// `session_mode` affects ONLY group/channel keys: in `.assistant` mode,
+/// when the peer carries a `sender_id`, the key includes `:peer:<sender_id>`
+/// so each member of a shared channel gets a private session lane. In
+/// `.cowork` mode (default), all members of a channel share one key.
+/// DMs (peer.kind == .direct) ignore session_mode — they're always
+/// per-user via the DmScope path below.
 pub fn buildSessionKeyWithScope(
     allocator: std.mem.Allocator,
     agent_id: []const u8,
     channel: []const u8,
     peer: ?PeerRef,
     dm_scope: config_types.DmScope,
+    session_mode: config_types.SessionMode,
     account_id: ?[]const u8,
     identity_links: []const config_types.IdentityLink,
 ) ![]u8 {
@@ -168,8 +183,19 @@ pub fn buildSessionKeyWithScope(
             .channel => "channel",
         };
 
-        // Groups and channels always use per-channel-peer scope
+        // Groups and channels: cowork (default) → shared session per
+        // channel; assistant → private session per (channel, sender)
+        // when the caller threads sender_id through.
         if (p.kind != .direct) {
+            if (session_mode == .assistant) {
+                if (p.sender_id) |sender_id| {
+                    if (sender_id.len > 0) {
+                        return std.fmt.allocPrint(allocator, "agent:{s}:{s}:{s}:{s}:peer:{s}", .{
+                            norm_agent, channel, kind_str, p.id, sender_id,
+                        });
+                    }
+                }
+            }
             return std.fmt.allocPrint(allocator, "agent:{s}:{s}:{s}:{s}", .{
                 norm_agent, channel, kind_str, p.id,
             });
@@ -450,6 +476,7 @@ pub fn resolveRouteWithSession(
         input.channel,
         input.peer,
         session.dm_scope,
+        session.mode,
         input.account_id,
         session.identity_links,
     );
@@ -931,7 +958,7 @@ test "buildSessionKeyWithScope — per_channel_peer (default)" {
     const key = try buildSessionKeyWithScope(allocator, "bot1", "discord", .{
         .kind = .direct,
         .id = "user42",
-    }, .per_channel_peer, null, &.{});
+    }, .per_channel_peer, .cowork, null, &.{});
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:discord:direct:user42", key);
 }
@@ -941,7 +968,7 @@ test "buildSessionKeyWithScope — main scope" {
     const key = try buildSessionKeyWithScope(allocator, "bot1", "discord", .{
         .kind = .direct,
         .id = "user42",
-    }, .main, null, &.{});
+    }, .main, .cowork, null, &.{});
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:main", key);
 }
@@ -951,7 +978,7 @@ test "buildSessionKeyWithScope — per_peer scope" {
     const key = try buildSessionKeyWithScope(allocator, "bot1", "discord", .{
         .kind = .direct,
         .id = "user42",
-    }, .per_peer, null, &.{});
+    }, .per_peer, .cowork, null, &.{});
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:direct:user42", key);
 }
@@ -961,7 +988,7 @@ test "buildSessionKeyWithScope — per_account_channel_peer scope" {
     const key = try buildSessionKeyWithScope(allocator, "bot1", "discord", .{
         .kind = .direct,
         .id = "user42",
-    }, .per_account_channel_peer, "work", &.{});
+    }, .per_account_channel_peer, .cowork, "work", &.{});
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:discord:work:direct:user42", key);
 }
@@ -971,9 +998,57 @@ test "buildSessionKeyWithScope — group always per-channel" {
     const key = try buildSessionKeyWithScope(allocator, "bot1", "discord", .{
         .kind = .group,
         .id = "G123",
-    }, .main, null, &.{});
+    }, .main, .cowork, null, &.{});
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:discord:group:G123", key);
+}
+
+test "buildSessionKeyWithScope — assistant mode in group adds peer suffix" {
+    const allocator = std.testing.allocator;
+    const key = try buildSessionKeyWithScope(allocator, "bot1", "slack", .{
+        .kind = .channel,
+        .id = "C123",
+        .sender_id = "U_alice",
+    }, .per_channel_peer, .assistant, null, &.{});
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:bot1:slack:channel:C123:peer:U_alice", key);
+}
+
+test "buildSessionKeyWithScope — assistant mode without sender_id falls back to cowork shape" {
+    const allocator = std.testing.allocator;
+    // sender_id null means caller hasn't threaded it through yet — we
+    // should NOT crash, just emit the cowork shape so behavior is safe.
+    const key = try buildSessionKeyWithScope(allocator, "bot1", "slack", .{
+        .kind = .channel,
+        .id = "C123",
+    }, .per_channel_peer, .assistant, null, &.{});
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:bot1:slack:channel:C123", key);
+}
+
+test "buildSessionKeyWithScope — cowork mode ignores sender_id" {
+    const allocator = std.testing.allocator;
+    // Even if sender_id IS supplied, cowork mode never includes it —
+    // backward-compat with all existing tests + default behavior.
+    const key = try buildSessionKeyWithScope(allocator, "bot1", "slack", .{
+        .kind = .channel,
+        .id = "C123",
+        .sender_id = "U_alice",
+    }, .per_channel_peer, .cowork, null, &.{});
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:bot1:slack:channel:C123", key);
+}
+
+test "buildSessionKeyWithScope — assistant mode does NOT affect DMs" {
+    const allocator = std.testing.allocator;
+    // DMs (.direct) are always per-user via DmScope. Mode is irrelevant.
+    const key = try buildSessionKeyWithScope(allocator, "bot1", "telegram", .{
+        .kind = .direct,
+        .id = "user42",
+        .sender_id = "user42",
+    }, .per_channel_peer, .assistant, null, &.{});
+    defer allocator.free(key);
+    try std.testing.expectEqualStrings("agent:bot1:telegram:direct:user42", key);
 }
 
 test "buildSessionKeyWithScope — identity link resolves peer" {
@@ -985,7 +1060,7 @@ test "buildSessionKeyWithScope — identity link resolves peer" {
     const key = try buildSessionKeyWithScope(allocator, "bot1", "telegram", .{
         .kind = .direct,
         .id = "telegram:123",
-    }, .per_channel_peer, null, &links);
+    }, .per_channel_peer, .cowork, null, &links);
     defer allocator.free(key);
     try std.testing.expectEqualStrings("agent:bot1:telegram:direct:alice", key);
 }
@@ -1336,6 +1411,7 @@ test "dmScope controls direct-message session key isolation" {
             "whatsapp",
             .{ .kind = .direct, .id = "+15551234567" },
             c[0],
+            .cowork,
             null,
             &.{},
         );
@@ -1352,6 +1428,7 @@ test "per_account_channel_peer isolates per account, channel, sender" {
         "telegram",
         .{ .kind = .direct, .id = "7550356539" },
         .per_account_channel_peer,
+        .cowork,
         "tasks",
         &.{},
     );
@@ -1367,6 +1444,7 @@ test "per_account_channel_peer uses default when account not provided" {
         "telegram",
         .{ .kind = .direct, .id = "7550356539" },
         .per_account_channel_peer,
+        .cowork,
         null,
         &.{},
     );
@@ -1386,6 +1464,7 @@ test "identityLinks applies to per_peer scope" {
         "telegram",
         .{ .kind = .direct, .id = "telegram:111111111" },
         .per_peer,
+        .cowork,
         null,
         &links,
     );
@@ -1405,6 +1484,7 @@ test "identityLinks applies to per_channel_peer scope" {
         "discord",
         .{ .kind = .direct, .id = "discord:222222222222222222" },
         .per_channel_peer,
+        .cowork,
         null,
         &links,
     );
@@ -1422,6 +1502,7 @@ test "distinct keys for DM vs channel — main scope" {
         "discord",
         .{ .kind = .direct, .id = "user123" },
         .main,
+        .cowork,
         "default",
         &.{},
     );
@@ -1432,6 +1513,7 @@ test "distinct keys for DM vs channel — main scope" {
         "discord",
         .{ .kind = .channel, .id = "channel456" },
         .main,
+        .cowork,
         "default",
         &.{},
     );
@@ -1449,6 +1531,7 @@ test "distinct keys for DM vs channel — per_peer scope" {
         "discord",
         .{ .kind = .direct, .id = "user123" },
         .per_peer,
+        .cowork,
         "default",
         &.{},
     );
@@ -1459,6 +1542,7 @@ test "distinct keys for DM vs channel — per_peer scope" {
         "discord",
         .{ .kind = .channel, .id = "channel456" },
         .per_peer,
+        .cowork,
         "default",
         &.{},
     );
