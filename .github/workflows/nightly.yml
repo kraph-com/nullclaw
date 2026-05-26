@@ -31,3 +31,5 @@ jobs:
       release_tag: nightly
       release_title: NullClaw Nightly
       force: ${{ inputs.force || false }}
+      # See release.yml — fork ships all engines including postgres.
+      build_args: "-Dengines=all"
